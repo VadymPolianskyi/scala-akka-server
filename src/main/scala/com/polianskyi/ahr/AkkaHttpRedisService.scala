@@ -1,20 +1,22 @@
 package com.polianskyi.ahr
 
-import java.util.concurrent.TimeUnit
-
-import akka.actor.ActorRef
+import akka.actor.{ActorRef, ActorSystem}
+import akka.event.LoggingAdapter
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import akka.http.scaladsl.model.StatusCodes.{InternalServerError, OK}
+import akka.http.scaladsl.model.StatusCodes.{InternalServerError, NoContent, OK}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.server.directives.Credentials
 import akka.pattern.ask
+import akka.stream.Materializer
 import akka.util.Timeout
 import com.polianskyi.ahr.model.UserHandler
-import com.polianskyi.ahr.model.UserHandler.{GetUser, User, UserDeleted, UserNotFound}
+import com.polianskyi.ahr.model.UserHandler._
+import com.polianskyi.ahr.repository.ConcreteRedis
+import com.typesafe.config.Config
 import spray.json.DefaultJsonProtocol
 
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContextExecutor, Future}
 
 case class UserPwd(pwd: String)
 case class UpsertRequest(username: String, password: String)
@@ -29,9 +31,22 @@ trait Protocols extends DefaultJsonProtocol {
 
 trait Service extends Protocols {
 
-  implicit def requestTimeout: Timeout = Timeout(5, TimeUnit.SECONDS)
+  import scala.concurrent.duration._
+
+  implicit val system: ActorSystem
+
+  implicit def executor: ExecutionContextExecutor
+
+  implicit val materializer: Materializer
+
+  def config: Config
+
+  val logger: LoggingAdapter
 
   def userHandler: ActorRef
+
+  implicit def requestTimeout: Timeout = Timeout(5 seconds)
+
 
   def userAuthenticate(credentials: Credentials): Future[Option[UserPwd]] = {
     credentials match {
@@ -44,7 +59,7 @@ trait Service extends Protocols {
     }
   }
 
-  def fetchUserId(userName: String): Future[Option[UserPwd]] ={
+  def fetchUserId(userName: String): Future[Option[UserPwd]] = {
     (userHandler ? GetUser(userName)).map {
       case User(_, p) => Some(UserPwd(p))
       case _ => None
@@ -52,13 +67,13 @@ trait Service extends Protocols {
   }
 
 
-//  registration
+  //  registration
   val unsecuredRoutes: Route = {
     pathPrefix("api") {
       pathPrefix("user") {
         path("register") {
           put {
-            entity(as[UpsertRequest]) {u =>
+            entity(as[UpsertRequest]) { u =>
               complete {
                 (userHandler ? UserHandler.Register(u.username, u.password)).map {
                   case true => OK -> s"Thank you ${u.username}"
@@ -71,6 +86,52 @@ trait Service extends Protocols {
       }
     }
   }
+
+  val routes =
+    logRequestResult("akka-http-secured-service") {
+      authenticateBasicAsync(realm = "secure site", userAuthenticate) { user =>
+        pathPrefix("user") {
+          path("add") {
+            put {
+              entity(as[UpsertRequest]) { u =>
+                complete {
+                  (userHandler ? Register(u.username, u.password)).mapTo[User]
+                }
+              }
+            }
+          } ~
+          path(Segment) { id =>
+            get {
+              complete {
+                (userHandler ? GetUser(id)).mapTo[User]
+              }
+            }
+          } ~
+          path(Segment) { id =>
+            post {
+              entity(as[UpsertRequest]) { u =>
+                complete {
+                  (userHandler ? UserHandler.Update(u.username, u.password)).map {
+                    case false => InternalServerError -> s"Could not update user $id"
+                    case _ => NoContent -> ""
+                  }
+                }
+              }
+            }
+          } ~
+          path(Segment) { id =>
+            delete {
+              complete {
+                (userHandler ? UserHandler.DeleteUser(id)).map {
+                  case UserNotFound(uname) => InternalServerError -> s"Could not delete user $uname"
+                  case u: UserDeleted => NoContent -> ""
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 }
 
 object AkkaHttpRedisService {
