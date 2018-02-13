@@ -1,19 +1,21 @@
 package com.polianskyi.ahr
 
 import akka.actor.{ActorRef, ActorSystem}
-import akka.event.LoggingAdapter
+import akka.event.{Logging, LoggingAdapter}
+import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.model.StatusCodes.{InternalServerError, NoContent, OK}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.server.directives.Credentials
 import akka.pattern.ask
-import akka.stream.Materializer
+import akka.stream.{ActorMaterializer, Materializer}
 import akka.util.Timeout
 import com.polianskyi.ahr.model.UserHandler
 import com.polianskyi.ahr.model.UserHandler._
-import com.polianskyi.ahr.repository.ConcreteRedis
-import com.typesafe.config.Config
+import com.polianskyi.ahr.repository.{ConcreteRedis, RedisRepoImpl}
+import com.typesafe.config.{Config, ConfigFactory}
+import redis.RedisClient
 import spray.json.DefaultJsonProtocol
 
 import scala.concurrent.{ExecutionContextExecutor, Future}
@@ -134,6 +136,17 @@ trait Service extends Protocols {
     }
 }
 
-object AkkaHttpRedisService {
+object AkkaHttpRedisService extends App with Service with ConcreteRedis {
+  override implicit val system = ActorSystem()
+  override implicit val executor = system.dispatcher
+  override implicit val materializer = ActorMaterializer()
+  val probDb = new RedisRepoImpl {
+    override def db: RedisClient = RedisClient(host = redisUrl.getHost, port = redisUrl.getPort, password = pwd)
+  }
 
+  override val config = ConfigFactory.load()
+  override val logger = Logging(system, getClass)
+  val userHandler = system.actorOf(UserHandler.props(probDb))
+
+  Http().bindAndHandle(unsecuredRoutes ~ routes, config.getString("http.interface"), config.getInt("http.port"))
 }
